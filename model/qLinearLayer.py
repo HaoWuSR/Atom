@@ -31,6 +31,9 @@ class QLinearLayer(nn.Module):
         
     @torch.no_grad()
     def forward(self, x):
+        print(x.device)
+        weight_tensor = self.weight.to(x.device)
+        self.weight = nn.Parameter(weight_tensor)
         y = torch.functional.F.linear(x, self.weight, self.bias)
         return y
     
@@ -61,7 +64,7 @@ class QLinearLayer(nn.Module):
             self.weight[:, -self.args.keeper:] = 0
 
         self.weight = quantize_tensor_channel_group(
-            self.weight.clone(), 
+            torch.nn.Parameter(self.weight.clone()), 
             n_bits=self.args.wbits,
             exponential=self.args.exponential, 
             sym=self.args.w_sym,
@@ -85,3 +88,5 @@ class QLinearLayer(nn.Module):
                 out_reorder_index = out_reorder_index.to(self.weight.device)
                 self.weight = torch.index_select(self.weight, 0, out_reorder_index)
         return
+
+

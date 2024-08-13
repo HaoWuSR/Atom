@@ -93,7 +93,7 @@ def add_act_quant_wrapper_opt(model, device, args, scales=None):
             continue
 
         m = m.to(device)
-
+        
         m.self_attn.act_quant = partial(quantize_activation_wrapper, args=args)
         m.self_attn.v_quant = partial(quantize_attn_v_wrapper, args=args)
         m.self_attn.k_quant = partial(quantize_attn_k_wrapper, args=args)

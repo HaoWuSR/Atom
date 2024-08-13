@@ -3,14 +3,16 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
-from transformers.models.mixtral.modeling_mixtral import MixtralDecoderLayer
+# from transformers.models.mixtral.modeling_mixtral import MixtralDecoderLayer
 from qLinearLayer import find_qlinear_layers
 from qLlamaLayer import QLlamaDecoderLayer
-from qMixtralLayer import QMixtralDecoderLayer
+# from qMixtralLayer import QMixtralDecoderLayer
 from gptq import GPTQ, Quantizer_GPTQ
 from functools import partial
 
 from quant import quantize_activation_wrapper, quantize_attn_v_wrapper, quantize_attn_k_wrapper
+
+
 
 def reorder_model_llama(model, device, args, reorder_index):
     model.config.use_cache = False
@@ -23,6 +25,7 @@ def reorder_model_llama(model, device, args, reorder_index):
         if isinstance(layers[i], LlamaDecoderLayer):
             m = QLlamaDecoderLayer(
                 originalLayer=layers[i],
+                layer_idx=i,
                 args=args,
             )
         elif isinstance(layers[i], QLlamaDecoderLayer):
@@ -77,11 +80,13 @@ def reorder_model_llama(model, device, args, reorder_index):
 def add_act_quant_wrapper_llama(model, device, args, scales):
     model.config.use_cache = False
     layers = model.model.layers
+    print(len(layers))
     for i in tqdm(range(len(layers))):
         m = None
         if isinstance(layers[i], LlamaDecoderLayer):
             m = QLlamaDecoderLayer(
                 originalLayer=layers[i],
+                layer_idx=i,
                 args=args,
             )
         elif isinstance(layers[i], QLlamaDecoderLayer):
@@ -131,6 +136,7 @@ def quantize_model_llama(model, device, args):
         if isinstance(layers[i], LlamaDecoderLayer):
             m = QLlamaDecoderLayer(
                 originalLayer=layers[i],
+                layer_idx=i,
                 args=args,
             )
         elif isinstance(layers[i], QLlamaDecoderLayer):
@@ -205,12 +211,13 @@ def quantize_model_gptq_llama(model, device, args, dataloader):
                 originalLayer=layers[i],
                 args=args,
             )
-        elif isinstance(layers[i], MixtralDecoderLayer):
-            m = QMixtralDecoderLayer(
-                originalLayer=layers[i],
-                args=args,
-            )
-        elif isinstance(layers[i], QLlamaDecoderLayer) or isinstance(layers[i], QMixtralDecoderLayer):
+        # elif isinstance(layers[i], MixtralDecoderLayer):
+        #     m = QMixtralDecoderLayer(
+        #         originalLayer=layers[i],
+        #         args=args,
+        #     )
+        # elif isinstance(layers[i], QLlamaDecoderLayer) or isinstance(layers[i], QMixtralDecoderLayer):
+        elif isinstance(layers[i], QLlamaDecoderLayer):
             m = layers[i]
         else:
             continue
@@ -271,3 +278,4 @@ def quantize_model_gptq_llama(model, device, args, dataloader):
 
     model.config.use_cache = use_cache
     return model
+

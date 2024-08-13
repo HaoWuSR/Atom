@@ -272,7 +272,10 @@ class GPTQ:
         H = torch.cholesky_inverse(H)
         H = torch.linalg.cholesky(H, upper=True)
         Hinv = H
-        
+        g_idx = []
+        scale = []
+        zero = [] 
+        now_idx = 1
         for i1 in range(0, self.n_nonout, blocksize):
             i2 = min(i1 + blocksize, self.n_nonout)
             count = i2 - i1

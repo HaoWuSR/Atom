@@ -6,13 +6,19 @@ from collections import defaultdict
 from pprint import pprint
 from modelutils_llama import quantize_model_llama, reorder_model_llama, quantize_model_gptq_llama,  add_act_quant_wrapper_llama
 from modelutils_opt import quantize_model_opt, reorder_model_opt, quantize_model_gptq_opt,  add_act_quant_wrapper_opt
-from modelutils_mixtral import quantize_model_mixtral, add_act_quant_wrapper_mixtral, reorder_model_mixtral
+# from modelutils_mixtral import quantize_model_mixtral, add_act_quant_wrapper_mixtral, reorder_model_mixtral
 from parallel_utils import map_layers_to_multi_gpus
 from LMClass import LMClass
 from eval import pattern_match
 from lm_eval import tasks as lm_tasks
 from lm_eval import evaluator as lm_evaluator
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from share_tensors_across_processes import load_checkpoint_shared_and_dispatch
+import accelerate
+from qLinearLayer import find_qlinear_layers
 
+# def llama_pack(model,quantizers,wbits,groupsize):
+    # qlayers= find_qlinear_layers(model,[])
 
 def get_llama(model):
     import torch
@@ -22,7 +28,7 @@ def get_llama(model):
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
     from transformers import LlamaForCausalLM
-    model = LlamaForCausalLM.from_pretrained(model, torch_dtype=torch.float16)
+    model = LlamaForCausalLM.from_pretrained(model, torch_dtype=torch.float16,device_map="auto")
     model.seqlen = 2048
     return model
 
@@ -45,7 +51,7 @@ def get_mixtral(model):
     torch.nn.init.kaiming_uniform_ = skip
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+
     model = AutoModelForCausalLM.from_pretrained(model, torch_dtype=torch.float16)
     model.seqlen = 2048
     return model
@@ -194,7 +200,7 @@ if __name__ == '__main__':
     assert model_name != None, "Please check the model path."
 
     if "llama" in args.model.lower():
-        model = get_llama(args.model)
+        model_fp16 = get_llama(args.model)
         get_act_stats_func = get_act_stats_llama
         reorder_model_func = reorder_model_llama
         add_act_quant_wrapper_func = add_act_quant_wrapper_llama
@@ -209,30 +215,54 @@ if __name__ == '__main__':
         quantize_model_gptq_func = quantize_model_gptq_opt
         quantize_model_func = quantize_model_opt
         eval_func = opt_eval
-    elif "mixtral" in args.model.lower():
-        model = get_mixtral(args.model)
-        get_act_stats_func = get_act_stats_llama
-        reorder_model_func = reorder_model_mixtral
-        add_act_quant_wrapper_func = add_act_quant_wrapper_mixtral
-        quantize_model_gptq_func = quantize_model_gptq_llama
-        quantize_model_func = quantize_model_mixtral
-        eval_func = llama_eval
-    model.eval()
+    # elif "mixtral" in args.model.lower():
+    #     model = get_mixtral(args.model)
+    #     get_act_stats_func = get_act_stats_llama
+    #     reorder_model_func = reorder_model_mixtral
+    #     add_act_quant_wrapper_func = add_act_quant_wrapper_mixtral
+    #     quantize_model_gptq_func = quantize_model_gptq_llama
+    #     quantize_model_func = quantize_model_mixtral
+    #     eval_func = llama_eval
+    # model_fp16=model_fp16.to("cuda")
+    device = model_fp16.device
+    model_fp16.eval()
+    text = "Tell me something about computer science"
+    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
+    input_ids = tokenizer(text, return_tensors='pt').input_ids.to(model_fp16.device)
+    # input_ids = tokenizer.encode("tell me about computer science", return_tensors="pt").input_ids.to("cuda")
+    print(input_ids)
+    print(model_fp16.device)
+    # output = model(input_ids=input_ids,
+    #                     return_dict=True,)
+    # print(output)
+    # exit()
+    with torch.no_grad():
+        generated_ids = model_fp16.generate(
+            input_ids=input_ids,
+            do_sample=False,
+            min_length=20,
+            max_length=20,
+            use_cache=True,
+        )
 
+    # print(draft_output_ids['past_key_values'])
+    output= tokenizer.decode(generated_ids[0],skip_special_tokens=True)
+    print(output)
+    
     import os
 
     if args.reorder:
         if args.cache_index == False:
             dataloader, testloader = get_loaders(
-                args.dataset, nsamples=args.nsamples, seed=args.seed, model=args.model, seqlen=model.seqlen
+                args.dataset, nsamples=args.nsamples, seed=args.seed, model=args.model, seqlen=model_fp16.seqlen
             )
             print("Getting activation stats...")
             act_scales = get_act_stats_func(
-                model, dataloader, DEV, metric=args.act_sort_metric
+                model_fp16, dataloader, DEV, metric=args.act_sort_metric
             )
 
             print("Getting reording index...")
-            reorder_index = get_reorder_index(model, act_scales)
+            reorder_index = get_reorder_index(model_fp16, act_scales)
 
             if not os.path.exists(args.save_dir):
                 os.makedirs(args.save_dir)
@@ -244,15 +274,19 @@ if __name__ == '__main__':
             print("Loading cached reording index from disk...")
             reorder_index = torch.load(index_filename)
 
-        print("Reordering model...")
-        model = reorder_model_func(
-            model, device=DEV, args=args, reorder_index=reorder_index
+
+        model_fp16 = reorder_model_func(
+            model_fp16, device=DEV, args=args, reorder_index=reorder_index
         )
-    
+    model_fp16=model_fp16.to(device)
     if args.abits < 16:
         print("Inserting activations quantizers ...")
         scales = defaultdict(lambda: None)
-        model = add_act_quant_wrapper_func(model, device=DEV, args=args, scales=scales)
+        model_act_quantizers = add_act_quant_wrapper_func(model_fp16, device=DEV, args=args, scales=scales)
+    # print(model)
+    # if args.load:
+    #     model = load_quant(args.model,args.load,args.wbits,args.groupsize)
+
 
     if args.wbits < 16:
         print("Quantizing...")
@@ -260,10 +294,113 @@ if __name__ == '__main__':
             dataloader, testloader = get_loaders(
                 args.dataset, nsamples=args.nsamples, seed=args.seed, model=args.model, seqlen=model.seqlen
             )
-            model = quantize_model_gptq_func(model, device=DEV, args=args, dataloader=dataloader)
+            model_quantizers = quantize_model_gptq_func(model_act_quantizers, device=DEV, args=args, dataloader=dataloader)
         else:
-            model = quantize_model_func(model, device=DEV, args=args)
+            model_quantizers = quantize_model_func(model_act_quantizers, device=DEV, args=args)
 
+    # for name, param in model_fp16.named_parameters():
+    #     print(name)
+    #     print(param)
+    
+
+
+    print(model_fp16.device)
+    model_quantizers=model_quantizers.to(model_fp16.device)
+    print(model_quantizers.device)
+
+    model_quantizers.eval()
+    text = "Tell me something about computer science "
+    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
+    input_ids = tokenizer(text, return_tensors='pt').input_ids.to(model_quantizers.device)
+
+
+    with torch.no_grad():
+        generated_ids = model_quantizers.generate(
+            input_ids=input_ids,
+            do_sample=False,
+            min_length=100,
+            max_length=100,
+            use_cache=True,
+        )
+    print(generated_ids)
+    output= tokenizer.decode(generated_ids[0],skip_special_tokens=True)
+    print(output)
+
+
+
+
+    model_quantizers=model_quantizers.to("cuda")
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
+
+    save_dir="./pth/llama_7B_chat.bin"
+
+    # llama_pack(model_act_quantizers, model_quantizers)
+    torch.save(model_quantizers.state_dict(), save_dir)
+
+    from transformers import LlamaConfig, LlamaForCausalLM
+    # import accelerate
+    
+
+
+    # def noop(*args, **kwargs):
+    #     pass
+
+    # torch.nn.init.kaiming_uniform_ = noop
+    # torch.nn.init.uniform_ = noop
+    # torch.nn.init.normal_ = noop
+
+    torch.set_default_dtype(torch.half)
+    config = LlamaConfig.from_pretrained(args.model)
+    model = LlamaForCausalLM(config)
+    torch.set_default_dtype(torch.float)
+    model = model.eval()
+
+    model.seqlen = 2048
+
+    checkpoint ="./pth/llama_7B_chat.bin"
+
+    scales = defaultdict(lambda: None)
+    model = add_act_quant_wrapper_func(model, device=DEV, args=args, scales=scales)
+    model=model.to("cuda")
+        # model.load_state_dict(torch.load("./pth2/llama_chat.bin"))
+    # model = accelerate.load_checkpoint_and_dispatch(model, 
+            # checkpoint, device_map="auto", no_split_module_classes=['QLlamaDecoderLayer'])
+    model = load_checkpoint_shared_and_dispatch(model=model, 
+            checkpoint= checkpoint, device_map="auto", no_split_module_classes=['QLlamaDecoderLayer'])
+        
+    # model.load_state_dict(torch.load(checkpoint), strict=False)
+    print(model)
+    model.eval()
+    # exit()
+    # text = "Tell me something about computer science,Tell me something about computer science,Tell me something about computer science,Tell me something about computer science"
+    # input_ids = tokenizer(text, return_tensors='pt').input_ids.to(model.device)
+    input_ids = tokenizer.encode("Tell me something about computer science ", return_tensors="pt").to("cuda")
+    print(input_ids)
+    print(model.device)
+    # output = model(input_ids=input_ids,
+    #                     return_dict=True,)
+    # print(output)
+    # # exit()
+    
+    with torch.no_grad():
+        generated_ids = model.generate(
+            input_ids,
+            min_length=100,
+            max_length=100,
+            use_cache=True,
+        )
+    print(tokenizer.decode([el.item() for el in generated_ids[0]]))
+    # # print(draft_output_ids['past_key_values'])
+    # output= tokenizer.decode(generated_ids[0],skip_special_tokens=True)
+    # print(output)
+    # exit()
+    # from safetensors.torch import load_file as safe_load
+    # model.load_state_dict(safe_load("./pth/model.safetensors",device="cuda"), strict=False)
+    
+    # if type("./pth/") is not str:
+    #     args.load = args.load.as_posix()
+    # model.load_state_dict(torch.load("./pth/"), strict=False)
 
     if args.eval_ppl:
         datasets = ['wikitext2', 'ptb', 'c4']

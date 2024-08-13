@@ -32,8 +32,10 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
+    cos = cos.unsqueeze(unsqueeze_dim).to(q.device)
+    sin = sin.unsqueeze(unsqueeze_dim).to(q.device)
+    # print(cos.device)
+    # print(q.device)
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
@@ -53,6 +55,7 @@ class QLlamaDecoderLayer(nn.Module):
     def __init__(
         self,
         originalLayer: LlamaDecoderLayer,
+        layer_idx: int,
         args
     ):
         super().__init__()
@@ -60,6 +63,7 @@ class QLlamaDecoderLayer(nn.Module):
         self.hidden_size = originalLayer.hidden_size
         self.self_attn = QLlamaAttention(
             originalLayer.self_attn,
+            layer_idx,
             args
         )
         self.mlp = QLlamaMLP(
@@ -100,12 +104,14 @@ class QLlamaDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
+
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
             output_attentions=output_attentions,
+            cache_position=cache_position,
             use_cache=use_cache,
         )
         hidden_states = residual + hidden_states
@@ -113,17 +119,20 @@ class QLlamaDecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        print(f"The shape of post_attention_layernorm is {hidden_states.shape}")
         hidden_states = self.mlp(hidden_states)
+        print(f"The shape of mlp is {hidden_states.shape}")
         hidden_states = residual + hidden_states
-
+        print(f"The shape of hidden_states is {hidden_states.shape}")
         outputs = (hidden_states,)
-
+        
         if output_attentions:
             outputs += (self_attn_weights,)
 
         if use_cache:
             outputs += (present_key_value,)
-
+            
+        # print(f"The shape of outputs is {outputs.shape}")
         return outputs
 
 class QLlamaRMSNorm(nn.Module):
@@ -146,7 +155,9 @@ class QLlamaRMSNorm(nn.Module):
             result = torch.index_select(result, result.dim()-1, self.reorder_index)
 
         if self.args.abits < 16:
+
             result = self.act_quant(result)
+            # print(f"The shape of reuslt is : {result.shape}")
 
         return result
     
@@ -164,6 +175,7 @@ class QLlamaAttention(nn.Module):
     def __init__(
         self, 
         originalAttn: LlamaAttention,
+        layer_idx: int,
         args
     ):
         super().__init__()
@@ -177,6 +189,7 @@ class QLlamaAttention(nn.Module):
         self.num_key_value_groups = originalAttn.num_key_value_groups
         self.max_position_embeddings = originalAttn.max_position_embeddings
         self.rope_theta = originalAttn.rope_theta
+        self.layer_idx=layer_idx 
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
@@ -230,6 +243,7 @@ class QLlamaAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        cache_position: Optional[torch.LongTensor] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
@@ -241,25 +255,27 @@ class QLlamaAttention(nn.Module):
 
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
-            kv_seq_len += past_key_value[0].shape[-2]
+            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+
         
         # Fake quantize the key_states.
         # Preserve the position embedding info by first quantize.
         if self.q_kv_cache:
             key_states = self.k_quant(key_states)
-        
-        # cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         cos, sin = self.rotary_emb(value_states, position_ids)
         # query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
         # [bsz, nh, t, hd]
 
         if past_key_value is not None:
+            # sin and cos are specific to RoPE models; cache_position needed for the static cache
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
             # reuse k, v, self_attention
-            key_states = torch.cat([past_key_value[0], key_states], dim=2)
-            value_states = torch.cat([past_key_value[1], value_states], dim=2)
+            # key_states = torch.cat([past_key_value[0], key_states], dim=2)
+            # value_states = torch.cat([past_key_value[1], value_states], dim=2)
 
-        past_key_value = (key_states, value_states) if use_cache else None
+        # past_key_value = (key_states, value_states) if use_cache else None
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -285,7 +301,7 @@ class QLlamaAttention(nn.Module):
         # Fake quantize the value_states
         if self.q_kv_cache:
             value_states = self.v_quant(value_states)
-
+        
         attn_output = torch.matmul(attn_weights, value_states)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
@@ -302,7 +318,9 @@ class QLlamaAttention(nn.Module):
             attn_output = torch.index_select(attn_output, 2, self.reorder_index)
 
         # Quantize the attention output
+ 
         attn_output = self.act_quant(attn_output)
+
         attn_output = self.o_proj(attn_output)
 
         if not output_attentions:
@@ -345,7 +363,10 @@ class QLlamaMLP(nn.Module):
     @torch.no_grad()
     def forward(self, x):
         # input X: [b, seq, dim]: quantized
+
         tmpResult = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
         # Quantize the activations and feed into down_proj
+
         tmpResult = self.act_quant(tmpResult)
+
         return self.down_proj(tmpResult)

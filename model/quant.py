@@ -117,8 +117,14 @@ def quantize_tensor_channel_group(W: torch.tensor, n_bits, group_size, tiling, s
 # quant_type: ["int", "fp"] choosing from uniform/non-uniform quantization
 @torch.no_grad()
 def quantize_tensor(w: torch.tensor, n_bits, group_size, tiling, sym, clip_ratio=1.0, exponential=False, quant_type="int") -> torch.tensor:
+    
     savedShape = w.shape
+    print("here in quantize tensor")
+    print(savedShape)
+    print("group size is ")
+    print(group_size)
     w = w.squeeze()
+
     assert w.is_contiguous(), "tensor should be continous for bitsandbytes kernel."
 
     if tiling > 0:
@@ -127,7 +133,9 @@ def quantize_tensor(w: torch.tensor, n_bits, group_size, tiling, sym, clip_ratio
     if group_size > 0:
         assert w.shape[-1] % group_size == 0
         w = w.reshape(-1, group_size) # row-major order
-
+    print(w.shape)
+    if w.dim() == 1:
+        w = w.unsqueeze(0)
     assert w.dim() == 2, "Weight format should be: [num_groups, group_size]"
     assert n_bits < 16
     
@@ -201,13 +209,17 @@ def quantize_activation_wrapper(x: torch.tensor, args) -> torch.tensor:
     )
 
     savedShape = x.shape
+    print("here is the act shape")
+    print(savedShape)
     x = x.view(-1, savedShape[-1])
 
     assert args.act_group_size == 0 or (savedShape[-1]) % args.act_group_size == 0, "Group size should be divisible by (dim - keeper)."
 
     if args.keeper > 0:
         saved_x = x[:, -args.keeper:].clone().contiguous()
-    
+    print("here is outliner shape")
+    print(saved_x.shape)
+    # print(group_size)
     # Mixed-precision for outliers
     # FP8/INT8/FP16
     if args.keeper and args.keeper_precision > 0:
@@ -217,12 +229,13 @@ def quantize_activation_wrapper(x: torch.tensor, args) -> torch.tensor:
         elif args.keeper_precision == 2:
             saved_x = fake_quantize_quarter_E4M3(saved_x)
         elif args.keeper_precision == 3:
+            print("Keeper Calling")
             saved_x = quantize_tensor(saved_x, n_bits=8, group_size=0, tiling=0, sym=True, exponential=False)
     # Set zero to avoid interference
     if args.keeper > 0:
         x[:, -args.keeper:] = 0
-    
-    x = qFunction(x)
+    print("QFunction Calling")
+    x = qFunction(x) 
     # Set back the outliers
     if args.keeper > 0:
         x[:, -args.keeper:] = saved_x
@@ -239,7 +252,7 @@ def quantize_attn_v_wrapper(w: torch.tensor, args) -> torch.tensor:
     head_dim = w.shape[-1]
     saved_shape = w.shape
     w = w.reshape(-1, head_dim)
-
+    print("here is attn v")
     w = quantize_tensor(w, n_bits=args.abits, group_size=0, tiling=0, sym=False, clip_ratio=args.kv_clip_ratio, exponential=False)
     return w.view(saved_shape)
 
@@ -252,7 +265,7 @@ def quantize_attn_k_wrapper(w: torch.tensor, args) -> torch.tensor:
     head_dim = w.shape[-1]
     saved_shape = w.shape
     w = w.reshape(-1, head_dim)
-
+    print("here is attn k")
     w = quantize_tensor(w, n_bits=args.abits, group_size=0, tiling=0, sym=False, clip_ratio=args.kv_clip_ratio, exponential=False)
     return w.view(saved_shape)
 
@@ -269,14 +282,18 @@ class Quantizer(nn.Module):
         if self.args.static == False or self.scales is None:
             # Note that Atom is dynamic quantization.
             # Therefore, this is the only valid path.
+            print("here is in quantizer")
+            print(f"The hidden_states shape is : {hidden_states.shape}")
             return self.act_quant(hidden_states)
         
         savedShape = hidden_states.shape
+
         assert self.scales is not None, "Scales is None"
         assert self.args.a_sym == True, "Only support statically symmetric quantization"
         assert self.args.act_group_size == 0 or (savedShape[-1] - self.args.keeper) % self.args.act_group_size == 0, "Group size should be divisible by (dim - keeper)."
 
         hidden_states = hidden_states.view(-1, savedShape[-1])
+
         selected_states = hidden_states[:, self.args.keeper:].clone()
 
         if self.args.act_group_size > 0:
